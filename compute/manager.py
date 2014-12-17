@@ -40,6 +40,7 @@ import eventlet.timeout
 from oslo.config import cfg
 from oslo import messaging
 
+from keystoneclient.v2_0 import client
 from nova import block_device
 from nova.cells import rpcapi as cells_rpcapi
 from nova.cloudpipe import pipelib
@@ -217,12 +218,21 @@ CONF.import_opt('image_cache_subdirectory_name', 'nova.virt.imagecache')
 CONF.import_opt('image_cache_manager_interval', 'nova.virt.imagecache')
 CONF.import_opt('enabled', 'nova.rdp', group='rdp')
 CONF.import_opt('html5_proxy_base_url', 'nova.rdp', group='rdp')
+CONF.import_opt('neutron_admin_username', 'nova.network.neutronv2.api')
+CONF.import_opt('neutron_admin_password', 'nova.network.neutronv2.api')
+CONF.import_opt('neutron_admin_auth_url', 'nova.network.neutronv2.api')
 
 LOG = logging.getLogger(__name__)
 
 get_notifier = functools.partial(rpc.get_notifier, service='compute')
 wrap_exception = functools.partial(exception.wrap_exception,
                                    get_notifier=get_notifier)
+
+time_mapping = {'hourly': 60*60,
+                'daily': 60*60*24,
+                'weekly': 60*60*24*7,
+                'test': 820,
+                'monthly': 60*60*24*7*30}
 
 
 @utils.expects_func_args('migration')
@@ -2677,6 +2687,71 @@ class ComputeManager(manager.Manager):
                                 task_states.IMAGE_BACKUP)
         self._rotate_backups(context, instance, backup_type, rotation)
 
+    def _set_context_for_periodic_snapshot(self, context, tenant_id):
+        unscoped_token = client.Client(
+            username=CONF.neutron_admin_username,
+            password=CONF.neutron_admin_password,
+            auth_url=CONF.neutron_admin_auth_url)
+        scoped_token_ref = client.Client(
+            token=unscoped_token.auth_token,
+            auth_url=CONF.neutron_admin_auth_url,
+            tenant_id=tenant_id)
+        context.auth_token = scoped_token_ref.auth_token
+        context.project_id = tenant_id
+        context.user_id = scoped_token_ref.user_id
+
+    @periodic_task.periodic_task
+    def _backup_rotate_instance(self, context):
+        instances = instance_obj.InstanceList.get_by_host(
+            context, self.host, expected_attrs=['metadata'])
+        for instance in instances:
+            tenant_id = instance.project_id
+            backup_type = instance.metadata.get('backup_type')
+            rotation = instance.metadata.get('rotation')
+            backup_time = instance.metadata.get('backup_time')
+            backup_period = instance.metadata.get('backup_period')
+            if (backup_type in ['test','hourly', 'daily', 'weekly', 'monthly'] and
+                rotation):
+                if not backup_time:
+                    backup_time = timeutils.utcnow()
+                    instance.metadata['backup_time'] = backup_time
+                    instance.save()
+                backup_time = timeutils.parse_strtime(backup_time)
+                t_passed = (timeutils.utcnow() - backup_time).total_seconds()
+                period = time_mapping[backup_type]
+                if (t_passed - period) > 0:
+                    self._set_context_for_periodic_snapshot(context, tenant_id)
+                    instance.task_state = task_states.IMAGE_BACKUP
+                    backup_time = timeutils.utcnow()
+                    instance.metadata['backup_time'] = backup_time
+                    instance.save()
+                    backup_name = instance.display_name + '_backup'
+                    properties = {}
+                    properties['backup_type'] = backup_type
+                    properties['backup_time'] = backup_time
+                    properties['rotation'] = rotation
+                    image_meta = self._create_image(context, instance, backup_name,
+                                                    properties)
+                    self._do_snapshot_instance(context, image_meta['id'], instance,
+                                               rotation)
+                    self._rotate_backups(context, instance, backup_type,
+                                         rotation)
+
+    def _create_image(self, context, instance, name, extra_meta):
+    properties = {
+            'instance_uuid': instance.uuid,
+            'user_id': str(context.user_id),
+            'image_type': 'backup',
+        }
+        image_ref = instance.image_ref
+        image_meta = {}
+        image_meta['name'] = name
+        image_meta['is_public'] = False
+        image_meta['properties'] = extra_meta
+        image_meta['properties'].update(properties)
+        image_service = glance.get_default_image_service()
+        return image_service.create(context, image_meta)
+
     @wrap_exception()
     @reverts_task_state
     @wrap_instance_fault
@@ -2787,11 +2862,14 @@ class ComputeManager(manager.Manager):
         :param rotation: int representing how many backups to keep around;
             None if rotation shouldn't be used (as in the case of snapshots)
         """
+        if rotation:
+            rotation = int(rotation)
         image_service = glance.get_default_image_service()
-        filters = {'property-image_type': 'backup',
-                   'property-backup_type': backup_type,
-                   'property-instance_uuid': instance.uuid}
-
+        filters ={'properties': {'backup_type': backup_type,
+                                 'rotation': rotation,
+                                 'image_type': 'backup',
+                                 'instance_uuid': instance.uuid}
+		}
         images = image_service.detail(context, filters=filters,
                                       sort_key='created_at', sort_dir='desc')
         num_images = len(images)
