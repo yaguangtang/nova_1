@@ -5183,7 +5183,10 @@ class LibvirtDriver(driver.ComputeDriver):
         # ensure directories exist and are writable
         instance_path = libvirt_utils.get_instance_path(instance)
         LOG.debug(_('Checking instance files accessibility %s'), instance_path)
-        return os.access(instance_path, os.W_OK)
+        shared_instance_path = os.access(instance_path, os.W_OK)
+        shared_block_storage = (self.image_backend.backend().
+                                is_shared_block_storage())
+        return shared_instance_path or shared_block_storage
 
     def inject_network_info(self, instance, nw_info):
         self.firewall_driver.setup_basic_filtering(instance, nw_info)
