@@ -2575,6 +2575,13 @@ class ComputeManager(manager.Manager):
                 # Manager-detach
                 self.detach_volume(context, volume_id, instance)
 
+    @delete_image_on_error
+    def _do_snapshot_instance(self, context, image_id, instance, rotation):
+        if rotation < 0:
+            raise exception.RotationRequiredForBackup()
+        self._snapshot_instance(context, image_id, instance,
+                                task_states.IMAGE_BACKUP)
+
     @wrap_exception()
     @reverts_task_state
     @wrap_instance_event
@@ -2690,8 +2697,8 @@ class ComputeManager(manager.Manager):
 
     def _set_context_for_periodic_snapshot(self, context, tenant_id):
         unscoped_token = client.Client(
-            username=CONF.neutron_admin_username,
-            password=CONF.neutron_admin_password,
+            username='admin',
+            password='admin',
             auth_url=CONF.neutron_admin_auth_url)
         scoped_token_ref = client.Client(
             token=unscoped_token.auth_token,
@@ -2718,7 +2725,8 @@ class ComputeManager(manager.Manager):
                     instance.metadata['backup_time'] = backup_time
                     instance.save()
                 backup_time = timeutils.parse_strtime(backup_time)
-                t_passed = (timeutils.utcnow() - backup_time).total_seconds()
+                timedelta = timeutils.utcnow() - backup_time
+                t_passed = timedelta.days * 86400 + timedelta.seconds
                 period = time_mapping[backup_type]
                 if (t_passed - period) > 0:
                     self._set_context_for_periodic_snapshot(context, tenant_id)
@@ -2726,7 +2734,7 @@ class ComputeManager(manager.Manager):
                     backup_time = timeutils.utcnow()
                     instance.metadata['backup_time'] = backup_time
                     instance.save()
-                    backup_name = instance.display_name + '_backup'
+                    backup_name = instance.display_name + '_backup_' + backup_time.isoformat()
                     properties = {}
                     properties['backup_type'] = backup_type
                     properties['backup_time'] = backup_time
@@ -2739,7 +2747,7 @@ class ComputeManager(manager.Manager):
                                          rotation)
 
     def _create_image(self, context, instance, name, extra_meta):
-    properties = {
+    	properties = {
             'instance_uuid': instance.uuid,
             'user_id': str(context.user_id),
             'image_type': 'backup',
