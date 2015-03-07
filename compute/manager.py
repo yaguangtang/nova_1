@@ -121,6 +121,10 @@ compute_opts = [
     cfg.IntOpt('network_allocate_retries',
                default=0,
                help="Number of times to retry network allocation on failures"),
+    cfg.StrOpt('admin_tenant_username',
+               help="admin tenant username"),
+    cfg.StrOpt('admin_tenant_password',
+               help="admin tenant password"),
     ]
 
 interval_opts = [
@@ -218,9 +222,6 @@ CONF.import_opt('image_cache_subdirectory_name', 'nova.virt.imagecache')
 CONF.import_opt('image_cache_manager_interval', 'nova.virt.imagecache')
 CONF.import_opt('enabled', 'nova.rdp', group='rdp')
 CONF.import_opt('html5_proxy_base_url', 'nova.rdp', group='rdp')
-CONF.import_opt('neutron_admin_username', 'nova.network.neutronv2.api')
-CONF.import_opt('neutron_admin_password', 'nova.network.neutronv2.api')
-CONF.import_opt('neutron_admin_auth_url', 'nova.network.neutronv2.api')
 
 LOG = logging.getLogger(__name__)
 
@@ -2697,8 +2698,8 @@ class ComputeManager(manager.Manager):
 
     def _set_context_for_periodic_snapshot(self, context, tenant_id):
         unscoped_token = client.Client(
-            username='admin',
-            password='admin',
+            username=CONF.admin_tenant_username,
+            password=CONF.admin_tenant_password,
             auth_url=CONF.neutron_admin_auth_url)
         scoped_token_ref = client.Client(
             token=unscoped_token.auth_token,
@@ -2717,21 +2718,22 @@ class ComputeManager(manager.Manager):
             backup_type = instance.metadata.get('backup_type')
             rotation = instance.metadata.get('rotation')
             backup_time = instance.metadata.get('backup_time')
+            local_now = timeutils.utcnow() + timeutils.datetime.timedelta(hours=8)
             backup_period = instance.metadata.get('backup_period')
             if (backup_type in ['test','hourly', 'daily', 'weekly', 'monthly'] and
                 rotation):
                 if not backup_time:
-                    backup_time = timeutils.utcnow()
+                    backup_time = local_now
                     instance.metadata['backup_time'] = backup_time
                     instance.save()
                 backup_time = timeutils.parse_strtime(backup_time)
-                timedelta = timeutils.utcnow() - backup_time
+                timedelta = local_now - backup_time
                 t_passed = timedelta.days * 86400 + timedelta.seconds
                 period = time_mapping[backup_type]
                 if (t_passed - period) > 0:
                     self._set_context_for_periodic_snapshot(context, tenant_id)
                     instance.task_state = task_states.IMAGE_BACKUP
-                    backup_time = timeutils.utcnow()
+                    backup_time = local_now
                     instance.metadata['backup_time'] = backup_time
                     instance.save()
                     backup_name = instance.display_name + '_backup_' + backup_time.isoformat()
